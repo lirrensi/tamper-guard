@@ -2,10 +2,15 @@
 # Shutdowns PC when 3+ incorrect login attempts.
 
 # Threat level: random burglar, curios colleague, unprepared attacker.
+# Target: causal users who want better security while away.
 # Initial intent: to lock PC better while away.
+
 # Does not cover if attacker made log in - they can remove scripts or simply extract your keys anyway.
-# Does not cover coerced input.
+# Does not cover coerced input - no canary mechanism present, and even if it was its useless anyway cause restart resets the attack loop.
+
 # Use with BitLocker, else an attacker can repeat attempts multiple times or sideload if hardware is stolen.
+# Easily bypassable with Safe Mode: An attacker with physical access can reboot into Safe Mode (unless prevented by BitLocker/BIOS password), where Task Scheduler won't run.
+# This is not enterprise grade solution, use actual windows native hardening instead!
 
 
 #Requires -RunAsAdministrator
@@ -74,15 +79,50 @@ function Get-TaskStatus {
 
 function Get-Config {
     if (Test-Path $ConfigPath) {
-        return Get-Content $ConfigPath | ConvertFrom-Json
+        $content = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
+        if (-not $content.MaxAttempts) {
+            $content | Add-Member -MemberType NoteProperty -Name MaxAttempts -Value 3 -Force
+        }
+        if (-not $content.ScriptHashes) {
+            $content | Add-Member -MemberType NoteProperty -Name ScriptHashes -Value @{} -Force
+        }
+        return $content
     }
-    return @{ MaxAttempts = 3 }
+    return [PSCustomObject]@{
+        MaxAttempts = 3
+        ScriptHashes = @{}
+    }
+}
+
+function Save-Config {
+    param([pscustomobject]$Config)
+    Ensure-SecureStorage
+    $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigPath
 }
 
 function Set-Config {
     param([int]$MaxAttempts)
-    Ensure-SecureStorage
-    @{ MaxAttempts = $MaxAttempts } | ConvertTo-Json | Set-Content -Path $ConfigPath
+    $config = Get-Config
+    $config.MaxAttempts = $MaxAttempts
+    Save-Config $config
+}
+
+function Update-ScriptHashes {
+    param([hashtable]$Hashes)
+    if (-not $Hashes) {
+        return
+    }
+
+    $config = Get-Config
+    if (-not $config.ScriptHashes) {
+        $config | Add-Member -MemberType NoteProperty -Name ScriptHashes -Value @{} -Force
+    }
+
+    foreach ($key in $Hashes.Keys) {
+        $config.ScriptHashes.$key = $Hashes[$key]
+    }
+
+    Save-Config $config
 }
 
 function Get-FailCount {
@@ -116,30 +156,56 @@ function Register-TamperGuard {
 `$counterPath = '$CounterPath'
 `$configPath = '$ConfigPath'
 `$shutdownLog = '$ShutdownLogPath'
+`$scriptKey = 'OnFail'
 
-# Read config
-`$config = Get-Content `$configPath | ConvertFrom-Json
-`$maxAttempts = `$config.MaxAttempts
+`$scriptPath = $MyInvocation.MyCommand.Definition
+`$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
+`$maxAttempts = if (`$config -and `$config.MaxAttempts) { `$config.MaxAttempts } else { 3 }
+`$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
 
-# Increment counter
-`$count = 0
-`$val = Get-ItemProperty -Path `$counterPath -Name "Count" -ErrorAction SilentlyContinue
-if (`$val) {
-    `$count = `$val.Count
+if (`$expectedHash) {
+    `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
+    if (`$actualHash -ne `$expectedHash) {
+        "TamperGuard INTEGRITY FAILURE: `$scriptKey" | Out-File "$shutdownLog" -Append
+        throw "TamperGuard script hash mismatch"
+    }
 }
-`$count++
-if (-not (Test-Path `$counterPath)) {
-    New-Item -Path `$counterPath -Force | Out-Null
-}
-Set-ItemProperty -Path `$counterPath -Name "Count" -Value `$count
 
-# Check threshold
-if (`$count -ge `$maxAttempts) {
-    # Log the shutdown reason
-    "TAMPER DETECTED: `$count failed attempts - SHUTTING DOWN!" |
-        Out-File "$shutdownLog" -Append
-    Start-Sleep -Milliseconds 100
-    Stop-Computer -Force
+`$mutexName = 'Global\TamperGuard_Counter'
+`$mutex = New-Object System.Threading.Mutex($false, `$mutexName)
+`$locked = $false
+try {
+    `$locked = `$mutex.WaitOne(5000)
+    if (-not `$locked) {
+        "TamperGuard LOCK TIMEOUT: `$scriptKey" | Out-File "$shutdownLog" -Append
+        throw "Unable to acquire TamperGuard counter lock"
+    }
+
+    # Increment counter
+    `$count = 0
+    `$val = Get-ItemProperty -Path `$counterPath -Name 'Count' -ErrorAction SilentlyContinue
+    if (`$val) {
+        `$count = `$val.Count
+    }
+    `$count++
+    if (-not (Test-Path `$counterPath)) {
+        New-Item -Path `$counterPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path `$counterPath -Name 'Count' -Value `$count
+
+    # Check threshold
+    if (`$count -ge `$maxAttempts) {
+        # Log the shutdown reason
+        "TAMPER DETECTED: `$count failed attempts - SHUTTING DOWN!" |
+            Out-File "$shutdownLog" -Append
+        Start-Sleep -Milliseconds 100
+        Stop-Computer -Force
+    }
+} finally {
+    if (`$locked) {
+        `$mutex.ReleaseMutex()
+    }
+    `$mutex.Dispose()
 }
 "@
     Set-Content -Path $scriptFailPath -Value $scriptFailContent
@@ -148,10 +214,42 @@ if (`$count -ge `$maxAttempts) {
     $scriptResetPath = Join-Path $SecureDir "TamperGuard_OnSuccess.ps1"
     $scriptResetContent = @"
 `$counterPath = '$CounterPath'
-if (-not (Test-Path `$counterPath)) {
-    New-Item -Path `$counterPath -Force | Out-Null
+`$configPath = '$ConfigPath'
+`$shutdownLog = '$ShutdownLogPath'
+`$scriptKey = 'OnSuccess'
+
+`$scriptPath = $MyInvocation.MyCommand.Definition
+`$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
+`$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
+
+if (`$expectedHash) {
+    `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
+    if (`$actualHash -ne `$expectedHash) {
+        "TamperGuard INTEGRITY FAILURE: `$scriptKey" | Out-File "$shutdownLog" -Append
+        throw "TamperGuard script hash mismatch"
+    }
 }
-Set-ItemProperty -Path `$counterPath -Name "Count" -Value 0
+
+`$mutexName = 'Global\TamperGuard_Counter'
+`$mutex = New-Object System.Threading.Mutex($false, `$mutexName)
+`$locked = $false
+try {
+    `$locked = `$mutex.WaitOne(5000)
+    if (-not `$locked) {
+        "TamperGuard LOCK TIMEOUT: `$scriptKey" | Out-File "$shutdownLog" -Append
+        throw "Unable to acquire TamperGuard counter lock"
+    }
+
+    if (-not (Test-Path `$counterPath)) {
+        New-Item -Path `$counterPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path `$counterPath -Name 'Count' -Value 0
+} finally {
+    if (`$locked) {
+        `$mutex.ReleaseMutex()
+    }
+    `$mutex.Dispose()
+}
 "@
     Set-Content -Path $scriptResetPath -Value $scriptResetContent
 
@@ -159,12 +257,55 @@ Set-ItemProperty -Path `$counterPath -Name "Count" -Value 0
     $scriptLockPath = Join-Path $SecureDir "TamperGuard_OnLock.ps1"
     $scriptLockContent = @"
 `$counterPath = '$CounterPath'
-if (-not (Test-Path `$counterPath)) {
-    New-Item -Path `$counterPath -Force | Out-Null
+`$configPath = '$ConfigPath'
+`$shutdownLog = '$ShutdownLogPath'
+`$scriptKey = 'OnLock'
+
+`$scriptPath = $MyInvocation.MyCommand.Definition
+`$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
+`$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
+
+if (`$expectedHash) {
+    `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
+    if (`$actualHash -ne `$expectedHash) {
+        "TamperGuard INTEGRITY FAILURE: `$scriptKey" | Out-File "$shutdownLog" -Append
+        throw "TamperGuard script hash mismatch"
+    }
 }
-Set-ItemProperty -Path `$counterPath -Name "Count" -Value 0
+
+`$mutexName = 'Global\TamperGuard_Counter'
+`$mutex = New-Object System.Threading.Mutex($false, `$mutexName)
+`$locked = $false
+try {
+    `$locked = `$mutex.WaitOne(5000)
+    if (-not `$locked) {
+        "TamperGuard LOCK TIMEOUT: `$scriptKey" | Out-File "$shutdownLog" -Append
+        throw "Unable to acquire TamperGuard counter lock"
+    }
+
+    if (-not (Test-Path `$counterPath)) {
+        New-Item -Path `$counterPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path `$counterPath -Name 'Count' -Value 0
+} finally {
+    if (`$locked) {
+        `$mutex.ReleaseMutex()
+    }
+    `$mutex.Dispose()
+}
 "@
     Set-Content -Path $scriptLockPath -Value $scriptLockContent
+
+    $scriptHashSources = @{
+        OnFail = $scriptFailPath
+        OnSuccess = $scriptResetPath
+        OnLock = $scriptLockPath
+    }
+    $scriptHashes = @{}
+    foreach ($entry in $scriptHashSources.GetEnumerator()) {
+        $scriptHashes[$entry.Key] = (Get-FileHash -Algorithm SHA256 -Path $entry.Value).Hash
+    }
+    Update-ScriptHashes -Hashes $scriptHashes
 
     # Task 1: Trigger on FAILED login (Event 4625, local only)
     $xmlFail = @"
