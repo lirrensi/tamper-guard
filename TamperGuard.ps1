@@ -1,10 +1,56 @@
+# This little script creates a bruteforce prevention on physical access to a locked PC.
+# Shutdowns PC when 3+ incorrect login attempts.
+
+# Threat level: random burglar, curios colleague, unprepared attacker.
+# Initial intent: to lock PC better while away.
+# Use with BitLocker, else an attacker can repeat attempts multiple times or sideload if hardware is stolen.
+
+
 #Requires -RunAsAdministrator
 
 $TaskNameFail = "TamperGuard_FailCheck"
 $TaskNameReset = "TamperGuard_ResetCounter"
 $TaskNameLock = "TamperGuard_LockActivate"
-$CounterPath = "HKCU:\Volatile Environment\TamperGuard_Counter"
-$ConfigPath = "$env:TEMP\TamperGuard.json"
+$SecureDir = Join-Path $env:ProgramData "TamperGuard"
+$CounterPath = "HKLM:\SOFTWARE\TamperGuard"
+$ConfigPath = Join-Path $SecureDir "TamperGuard.json"
+$ShutdownLogPath = Join-Path $SecureDir "TamperGuard_Shutdown.log"
+
+function Ensure-SecureStorage {
+    if (-not (Test-Path $SecureDir)) {
+        New-Item -Path $SecureDir -ItemType Directory -Force | Out-Null
+        $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $propagation = [System.Security.AccessControl.PropagationFlags]::None
+        $ruleType = [System.Security.AccessControl.AccessControlType]::Allow
+
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+
+        $acl.AddAccessRule((
+            New-Object System.Security.AccessControl.FileSystemAccessRule(
+                "BUILTIN\Administrators",
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                $inheritance,
+                $propagation,
+                $ruleType)))
+        $acl.AddAccessRule((
+            New-Object System.Security.AccessControl.FileSystemAccessRule(
+                "NT AUTHORITY\SYSTEM",
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                $inheritance,
+                $propagation,
+                $ruleType)))
+        $acl.AddAccessRule((
+            New-Object System.Security.AccessControl.FileSystemAccessRule(
+                "Users",
+                [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+                $inheritance,
+                $propagation,
+                $ruleType)))
+
+        Set-Acl -Path $SecureDir -AclObject $acl
+    }
+}
 
 function Get-TaskStatus {
     $taskFail = Get-ScheduledTask -TaskName $TaskNameFail -ErrorAction SilentlyContinue
@@ -33,7 +79,8 @@ function Get-Config {
 
 function Set-Config {
     param([int]$MaxAttempts)
-    @{ MaxAttempts = $MaxAttempts } | ConvertTo-Json | Set-Content $ConfigPath
+    Ensure-SecureStorage
+    @{ MaxAttempts = $MaxAttempts } | ConvertTo-Json | Set-Content -Path $ConfigPath
 }
 
 function Get-FailCount {
@@ -52,8 +99,9 @@ function Register-TamperGuard {
         return
     }
 
+    Ensure-SecureStorage
     Set-Config -MaxAttempts $MaxAttempts
-    
+
     # Reset counter registry
     if (-not (Test-Path $CounterPath)) {
         New-Item -Path $CounterPath -Force | Out-Null
@@ -61,10 +109,11 @@ function Register-TamperGuard {
     Set-ItemProperty -Path $CounterPath -Name "Count" -Value 0
 
     # Script 1: Increment counter and check threshold on failed login
-    $scriptFailPath = "$env:TEMP\TamperGuard_OnFail.ps1"
+    $scriptFailPath = Join-Path $SecureDir "TamperGuard_OnFail.ps1"
     $scriptFailContent = @"
 `$counterPath = '$CounterPath'
 `$configPath = '$ConfigPath'
+`$shutdownLog = '$ShutdownLogPath'
 
 # Read config
 `$config = Get-Content `$configPath | ConvertFrom-Json
@@ -85,8 +134,8 @@ Set-ItemProperty -Path `$counterPath -Name "Count" -Value `$count
 # Check threshold
 if (`$count -ge `$maxAttempts) {
     # Log the shutdown reason
-    "TAMPER DETECTED: `$count failed attempts - SHUTTING DOWN!" | 
-        Out-File "$env:TEMP\TamperGuard_Shutdown.log" -Append
+    "TAMPER DETECTED: `$count failed attempts - SHUTTING DOWN!" |
+        Out-File "$shutdownLog" -Append
     Start-Sleep -Milliseconds 100
     Stop-Computer -Force
 }
@@ -94,7 +143,7 @@ if (`$count -ge `$maxAttempts) {
     Set-Content -Path $scriptFailPath -Value $scriptFailContent
 
     # Script 2: Reset counter on successful unlock
-    $scriptResetPath = "$env:TEMP\TamperGuard_OnSuccess.ps1"
+    $scriptResetPath = Join-Path $SecureDir "TamperGuard_OnSuccess.ps1"
     $scriptResetContent = @"
 `$counterPath = '$CounterPath'
 if (-not (Test-Path `$counterPath)) {
@@ -105,7 +154,7 @@ Set-ItemProperty -Path `$counterPath -Name "Count" -Value 0
     Set-Content -Path $scriptResetPath -Value $scriptResetContent
 
     # Script 3: Activate guard on workstation lock
-    $scriptLockPath = "$env:TEMP\TamperGuard_OnLock.ps1"
+    $scriptLockPath = Join-Path $SecureDir "TamperGuard_OnLock.ps1"
     $scriptLockContent = @"
 `$counterPath = '$CounterPath'
 if (-not (Test-Path `$counterPath)) {
@@ -245,7 +294,10 @@ function Unregister-TamperGuard {
         $removed++
     }
     
-    Remove-Item "$env:TEMP\TamperGuard_*.ps1" -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path $SecureDir "TamperGuard_*.ps1") -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $ConfigPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $ShutdownLogPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $SecureDir -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $CounterPath -Recurse -Force -ErrorAction SilentlyContinue
     
     if ($removed -gt 0) {
@@ -281,7 +333,7 @@ function Show-FailedAttempts {
     }
     
     # Show shutdown log if exists
-    $logPath = "$env:TEMP\TamperGuard_Shutdown.log"
+    $logPath = $ShutdownLogPath
     if (Test-Path $logPath) {
         Write-Host "`n[ALERT] SHUTDOWN LOG:" -ForegroundColor Red
         Write-Host "=================" -ForegroundColor Red
