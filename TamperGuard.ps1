@@ -3,7 +3,7 @@
 $TaskNameFail = "TamperGuard_FailCheck"
 $TaskNameReset = "TamperGuard_ResetCounter"
 $TaskNameLock = "TamperGuard_LockActivate"
-$CounterPath = "$env:TEMP\TamperGuard_Counter.txt"
+$CounterPath = "HKCU:\Volatile Environment\TamperGuard_Counter"
 $ConfigPath = "$env:TEMP\TamperGuard.json"
 
 function Get-TaskStatus {
@@ -37,8 +37,9 @@ function Set-Config {
 }
 
 function Get-FailCount {
-    if (Test-Path $CounterPath) {
-        return [int](Get-Content $CounterPath)
+    $val = Get-ItemProperty -Path $CounterPath -Name "Count" -ErrorAction SilentlyContinue
+    if ($val) {
+        return $val.Count
     }
     return 0
 }
@@ -53,8 +54,11 @@ function Register-TamperGuard {
 
     Set-Config -MaxAttempts $MaxAttempts
     
-    # Reset counter file
-    "0" | Set-Content $CounterPath
+    # Reset counter registry
+    if (-not (Test-Path $CounterPath)) {
+        New-Item -Path $CounterPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $CounterPath -Name "Count" -Value 0
 
     # Script 1: Increment counter and check threshold on failed login
     $scriptFailPath = "$env:TEMP\TamperGuard_OnFail.ps1"
@@ -68,11 +72,15 @@ function Register-TamperGuard {
 
 # Increment counter
 `$count = 0
-if (Test-Path `$counterPath) {
-    `$count = [int](Get-Content `$counterPath)
+`$val = Get-ItemProperty -Path `$counterPath -Name "Count" -ErrorAction SilentlyContinue
+if (`$val) {
+    `$count = `$val.Count
 }
 `$count++
-`$count | Set-Content `$counterPath
+if (-not (Test-Path `$counterPath)) {
+    New-Item -Path `$counterPath -Force | Out-Null
+}
+Set-ItemProperty -Path `$counterPath -Name "Count" -Value `$count
 
 # Check threshold
 if (`$count -ge `$maxAttempts) {
@@ -80,7 +88,7 @@ if (`$count -ge `$maxAttempts) {
     "TAMPER DETECTED: `$count failed attempts - SHUTTING DOWN!" | 
         Out-File "$env:TEMP\TamperGuard_Shutdown.log" -Append
     Start-Sleep -Milliseconds 100
-    shutdown /s /f /t 0
+    Stop-Computer -Force
 }
 "@
     Set-Content -Path $scriptFailPath -Value $scriptFailContent
@@ -89,7 +97,10 @@ if (`$count -ge `$maxAttempts) {
     $scriptResetPath = "$env:TEMP\TamperGuard_OnSuccess.ps1"
     $scriptResetContent = @"
 `$counterPath = '$CounterPath'
-"0" | Set-Content `$counterPath
+if (-not (Test-Path `$counterPath)) {
+    New-Item -Path `$counterPath -Force | Out-Null
+}
+Set-ItemProperty -Path `$counterPath -Name "Count" -Value 0
 "@
     Set-Content -Path $scriptResetPath -Value $scriptResetContent
 
@@ -97,7 +108,10 @@ if (`$count -ge `$maxAttempts) {
     $scriptLockPath = "$env:TEMP\TamperGuard_OnLock.ps1"
     $scriptLockContent = @"
 `$counterPath = '$CounterPath'
-"0" | Set-Content `$counterPath
+if (-not (Test-Path `$counterPath)) {
+    New-Item -Path `$counterPath -Force | Out-Null
+}
+Set-ItemProperty -Path `$counterPath -Name "Count" -Value 0
 "@
     Set-Content -Path $scriptLockPath -Value $scriptLockContent
 
@@ -232,7 +246,7 @@ function Unregister-TamperGuard {
     }
     
     Remove-Item "$env:TEMP\TamperGuard_*.ps1" -ErrorAction SilentlyContinue
-    Remove-Item $CounterPath -ErrorAction SilentlyContinue
+    Remove-Item -Path $CounterPath -Recurse -Force -ErrorAction SilentlyContinue
     
     if ($removed -gt 0) {
         Write-Host "DEL Tamper Guard removed! ($removed tasks)" -ForegroundColor Green
@@ -320,7 +334,10 @@ switch ($choice.ToUpper()) {
         Show-FailedAttempts -Last ([int]$count)
     }
     "5" {
-        "0" | Set-Content $CounterPath
+        if (-not (Test-Path $CounterPath)) {
+            New-Item -Path $CounterPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $CounterPath -Name "Count" -Value 0
         Write-Host "`nOK Counter reset to 0!" -ForegroundColor Green
     }
     "Q" {
