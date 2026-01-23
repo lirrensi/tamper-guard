@@ -3,6 +3,8 @@
 
 # Threat level: random burglar, curios colleague, unprepared attacker.
 # Initial intent: to lock PC better while away.
+# Does not cover if attacker made log in - they can remove scripts or simply extract your keys anyway.
+# Does not cover coerced input.
 # Use with BitLocker, else an attacker can repeat attempts multiple times or sideload if hardware is stolen.
 
 
