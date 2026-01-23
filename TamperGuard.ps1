@@ -59,6 +59,63 @@ function Ensure-SecureStorage {
     }
 }
 
+function Enable-WindowsAuditing {
+    Write-Host "   Configuring Windows Audit Policies..." -ForegroundColor Gray
+    if (Get-Command "auditpol.exe" -ErrorAction SilentlyContinue) {
+        auditpol /set /subcategory:"Logon" /success:enable | Out-Null
+        auditpol /set /subcategory:"Logon" /failure:enable | Out-Null
+        auditpol /set /subcategory:"Other Logon/Logoff Events" /success:enable | Out-Null
+    } else {
+        Write-Host "WARN: auditpol.exe not found. Events might not generate!" -ForegroundColor Red
+    }
+}
+
+function Test-AuditPolicy {
+    if (-not (Get-Command "auditpol.exe" -ErrorAction SilentlyContinue)) {
+        Write-Warning "auditpol.exe is missing; unable to verify audit policy."
+        return
+    }
+
+    $policy = auditpol /get /subcategory:"Logon" 2>$null
+    if ($policy -and ($policy -notmatch "Success and Failure|Failure")) {
+        Write-Warning "Audit policy for Logon may not be configured!"
+        Write-Warning 'Run: auditpol /set /subcategory:"Logon" /failure:enable'
+    }
+}
+
+function Normalize-MaxAttempts {
+    param([int]$Value)
+
+    if ($Value -lt 1) {
+        return 1
+    }
+    if ($Value -gt 10) {
+        return 10
+    }
+    return $Value
+}
+
+function Get-ValidatedMaxAttempts {
+    param(
+        [string]$Input,
+        [int]$Default = 3
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Input)) {
+        return $Default
+    }
+    $parsed = 0
+    if (-not [int]::TryParse($Input, [ref]$parsed)) {
+        Write-Host "Invalid max attempt value. Using default ($Default)." -ForegroundColor Yellow
+        return $Default
+    }
+    $validated = Normalize-MaxAttempts -Value $parsed
+    if ($validated -ne $parsed) {
+        Write-Host "Max attempts clamped to $validated (allowed range 1-10)." -ForegroundColor Yellow
+    }
+    return $validated
+}
+
 function Get-TaskStatus {
     $taskFail = Get-ScheduledTask -TaskName $TaskNameFail -ErrorAction SilentlyContinue
     $taskReset = Get-ScheduledTask -TaskName $TaskNameReset -ErrorAction SilentlyContinue
@@ -136,12 +193,16 @@ function Get-FailCount {
 function Register-TamperGuard {
     param([int]$MaxAttempts = 3)
     
+    $MaxAttempts = Normalize-MaxAttempts -Value $MaxAttempts
+    
     if (Get-ScheduledTask -TaskName $TaskNameFail -ErrorAction SilentlyContinue) {
         Write-Host "WARN Tasks already exist! Unregister first." -ForegroundColor Yellow
         return
     }
 
     Ensure-SecureStorage
+    Enable-WindowsAuditing
+    Test-AuditPolicy
     Set-Config -MaxAttempts $MaxAttempts
 
     # Reset counter registry
@@ -158,17 +219,31 @@ function Register-TamperGuard {
 `$shutdownLog = '$ShutdownLogPath'
 `$scriptKey = 'OnFail'
 
-`$scriptPath = $MyInvocation.MyCommand.Definition
+function Write-ShutdownLog {
+    param([string]$Message)
+    `$timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "`$timestamp `$Message" | Out-File "$shutdownLog" -Append
+}
+
+if (-not (Test-Path `$configPath)) {
+    Write-ShutdownLog "TamperGuard CONFIG MISSING - SECURITY ALERT"
+    Stop-Computer -Force
+}
+
+`$scriptPath = `$MyInvocation.MyCommand.Path
 `$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
 `$maxAttempts = if (`$config -and `$config.MaxAttempts) { `$config.MaxAttempts } else { 3 }
 `$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
 
-if (`$expectedHash) {
-    `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
-    if (`$actualHash -ne `$expectedHash) {
-        "TamperGuard INTEGRITY FAILURE: `$scriptKey" | Out-File "$shutdownLog" -Append
-        throw "TamperGuard script hash mismatch"
-    }
+if (-not `$expectedHash) {
+    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - BLOCKING EXECUTION"
+    throw "TamperGuard hash not configured - refusing to run"
+}
+
+`$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
+if (`$actualHash -ne `$expectedHash) {
+    Write-ShutdownLog "TamperGuard INTEGRITY FAILURE: `$scriptKey"
+    throw "TamperGuard script hash mismatch"
 }
 
 `$mutexName = 'Global\TamperGuard_Counter'
@@ -177,7 +252,7 @@ if (`$expectedHash) {
 try {
     `$locked = `$mutex.WaitOne(5000)
     if (-not `$locked) {
-        "TamperGuard LOCK TIMEOUT: `$scriptKey" | Out-File "$shutdownLog" -Append
+        Write-ShutdownLog "TamperGuard LOCK TIMEOUT: `$scriptKey"
         throw "Unable to acquire TamperGuard counter lock"
     }
 
@@ -196,8 +271,7 @@ try {
     # Check threshold
     if (`$count -ge `$maxAttempts) {
         # Log the shutdown reason
-        "TAMPER DETECTED: `$count failed attempts - SHUTTING DOWN!" |
-            Out-File "$shutdownLog" -Append
+        Write-ShutdownLog "TAMPER DETECTED: `$count failed attempts - SHUTTING DOWN!"
         Start-Sleep -Milliseconds 100
         Stop-Computer -Force
     }
@@ -218,16 +292,30 @@ try {
 `$shutdownLog = '$ShutdownLogPath'
 `$scriptKey = 'OnSuccess'
 
-`$scriptPath = $MyInvocation.MyCommand.Definition
+function Write-ShutdownLog {
+    param([string]$Message)
+    `$timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "`$timestamp `$Message" | Out-File "$shutdownLog" -Append
+}
+
+if (-not (Test-Path `$configPath)) {
+    Write-ShutdownLog "TamperGuard CONFIG MISSING - SECURITY ALERT"
+    Stop-Computer -Force
+}
+
+`$scriptPath = `$MyInvocation.MyCommand.Path
 `$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
 `$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
 
-if (`$expectedHash) {
-    `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
-    if (`$actualHash -ne `$expectedHash) {
-        "TamperGuard INTEGRITY FAILURE: `$scriptKey" | Out-File "$shutdownLog" -Append
-        throw "TamperGuard script hash mismatch"
-    }
+if (-not `$expectedHash) {
+    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - BLOCKING EXECUTION"
+    throw "TamperGuard hash not configured - refusing to run"
+}
+
+`$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
+if (`$actualHash -ne `$expectedHash) {
+    Write-ShutdownLog "TamperGuard INTEGRITY FAILURE: `$scriptKey"
+    throw "TamperGuard script hash mismatch"
 }
 
 `$mutexName = 'Global\TamperGuard_Counter'
@@ -236,7 +324,7 @@ if (`$expectedHash) {
 try {
     `$locked = `$mutex.WaitOne(5000)
     if (-not `$locked) {
-        "TamperGuard LOCK TIMEOUT: `$scriptKey" | Out-File "$shutdownLog" -Append
+        Write-ShutdownLog "TamperGuard LOCK TIMEOUT: `$scriptKey"
         throw "Unable to acquire TamperGuard counter lock"
     }
 
@@ -261,16 +349,30 @@ try {
 `$shutdownLog = '$ShutdownLogPath'
 `$scriptKey = 'OnLock'
 
-`$scriptPath = $MyInvocation.MyCommand.Definition
+function Write-ShutdownLog {
+    param([string]$Message)
+    `$timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "`$timestamp `$Message" | Out-File "$shutdownLog" -Append
+}
+
+if (-not (Test-Path `$configPath)) {
+    Write-ShutdownLog "TamperGuard CONFIG MISSING - SECURITY ALERT"
+    Stop-Computer -Force
+}
+
+`$scriptPath = `$MyInvocation.MyCommand.Path
 `$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
 `$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
 
-if (`$expectedHash) {
-    `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
-    if (`$actualHash -ne `$expectedHash) {
-        "TamperGuard INTEGRITY FAILURE: `$scriptKey" | Out-File "$shutdownLog" -Append
-        throw "TamperGuard script hash mismatch"
-    }
+if (-not `$expectedHash) {
+    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - BLOCKING EXECUTION"
+    throw "TamperGuard hash not configured - refusing to run"
+}
+
+`$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
+if (`$actualHash -ne `$expectedHash) {
+    Write-ShutdownLog "TamperGuard INTEGRITY FAILURE: `$scriptKey"
+    throw "TamperGuard script hash mismatch"
 }
 
 `$mutexName = 'Global\TamperGuard_Counter'
@@ -279,7 +381,7 @@ if (`$expectedHash) {
 try {
     `$locked = `$mutex.WaitOne(5000)
     if (-not `$locked) {
-        "TamperGuard LOCK TIMEOUT: `$scriptKey" | Out-File "$shutdownLog" -Append
+        Write-ShutdownLog "TamperGuard LOCK TIMEOUT: `$scriptKey"
         throw "Unable to acquire TamperGuard counter lock"
     }
 
@@ -320,7 +422,8 @@ try {
     </EventTrigger>
   </Triggers>
   <Principals>
-    <Principal>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
@@ -355,7 +458,8 @@ try {
     </EventTrigger>
   </Triggers>
   <Principals>
-    <Principal>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
@@ -390,7 +494,8 @@ try {
     </EventTrigger>
   </Triggers>
   <Principals>
-    <Principal>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
@@ -506,9 +611,9 @@ $choice = Read-Host "Choose option"
 
 switch ($choice.ToUpper()) {
     "1" {
-        $maxAttempts = Read-Host "Max attempts per lock session (default 3)"
-        if ([string]::IsNullOrWhiteSpace($maxAttempts)) { $maxAttempts = 3 }
-        Register-TamperGuard -MaxAttempts ([int]$maxAttempts)
+        $maxAttemptsInput = Read-Host "Max attempts per lock session (default 3)"
+        $maxAttempts = Get-ValidatedMaxAttempts -Input $maxAttemptsInput
+        Register-TamperGuard -MaxAttempts $maxAttempts
     }
     "2" {
         Unregister-TamperGuard
@@ -517,10 +622,11 @@ switch ($choice.ToUpper()) {
         if (-not (Get-TaskStatus)) {
             Write-Host "`nWARN Please register first!" -ForegroundColor Yellow
         } else {
-            $maxAttempts = Read-Host "`nEnter new max attempts"
+            $maxAttemptsInput = Read-Host "`nEnter new max attempts"
             Unregister-TamperGuard
             Start-Sleep -Seconds 1
-            Register-TamperGuard -MaxAttempts ([int]$maxAttempts)
+            $maxAttempts = Get-ValidatedMaxAttempts -Input $maxAttemptsInput
+            Register-TamperGuard -MaxAttempts $maxAttempts
         }
     }
     "4" {
