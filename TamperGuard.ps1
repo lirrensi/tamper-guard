@@ -1,3 +1,4 @@
+# v0.1
 # This little script creates a bruteforce prevention on physical access to a locked PC.
 # Shutdowns PC when 3+ incorrect login attempts.
 
@@ -22,65 +23,142 @@ $SecureDir = Join-Path $env:ProgramData "TamperGuard"
 $CounterPath = "HKLM:\SOFTWARE\TamperGuard"
 $ConfigPath = Join-Path $SecureDir "TamperGuard.json"
 $ShutdownLogPath = Join-Path $SecureDir "TamperGuard_Shutdown.log"
+$PowerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$AuditPolPath = Join-Path $env:SystemRoot "System32\auditpol.exe"
 
 function Ensure-SecureStorage {
-    if (-not (Test-Path $SecureDir)) {
+    # Use SIDs - they're universal across all languages!
+    $adminsSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544") # Administrators
+    $systemSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")     # SYSTEM
+    $usersSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-545")  # Users
+    
+    $expectedOwner = $adminsSID.Translate([System.Security.Principal.NTAccount])
+    
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $propagation = [System.Security.AccessControl.PropagationFlags]::None
+    $allowType = [System.Security.AccessControl.AccessControlType]::Allow
+
+    $secureAcl = New-Object System.Security.AccessControl.DirectorySecurity
+    $secureAcl.SetAccessRuleProtection($true, $false)
+    $secureAcl.SetOwner($expectedOwner)
+
+    # Administrators - Full Control
+    $secureAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $adminsSID,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        $inheritance,
+        $propagation,
+        $allowType)))
+    
+    # SYSTEM - Full Control
+    $secureAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $systemSID,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        $inheritance,
+        $propagation,
+        $allowType)))
+    
+    # Users - Read & Execute only
+    $secureAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $usersSID,
+        [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        $inheritance,
+        $propagation,
+        $allowType)))
+
+    $dirExists = Test-Path $SecureDir
+    if ($dirExists) {
+        $rootItem = Get-Item -LiteralPath $SecureDir -Force -ErrorAction Stop
+        if ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "SECURITY ERROR: $SecureDir is a reparse point. Aborting."
+        }
+
+        $expectedNames = @(
+            "TamperGuard_OnFail.ps1",
+            "TamperGuard_OnSuccess.ps1",
+            "TamperGuard_OnLock.ps1",
+            "TamperGuard.json",
+            "TamperGuard_Shutdown.log"
+        )
+
+        # Try to get items, but handle permission denied gracefully
+        try {
+            $existingItems = Get-ChildItem -LiteralPath $SecureDir -Force -ErrorAction Stop |
+                             Where-Object { $_.Name -ne '.' -and $_.Name -ne '..' }
+
+            foreach ($child in $existingItems) {
+                if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    throw "SECURITY ERROR: $SecureDir contains reparse item '$($child.Name)'. Aborting."
+                }
+                if ($expectedNames -notcontains $child.Name) {
+                    throw "SECURITY ERROR: $SecureDir contains unexpected item '$($child.Name)'. Aborting."
+                }
+            }
+        } catch [System.UnauthorizedAccessException] {
+            # If we can't read it, apply permissions anyway
+            Write-Host "   Fixing permissions on existing directory..." -ForegroundColor Yellow
+        }
+    } else {
         New-Item -Path $SecureDir -ItemType Directory -Force | Out-Null
-        $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-        $propagation = [System.Security.AccessControl.PropagationFlags]::None
-        $ruleType = [System.Security.AccessControl.AccessControlType]::Allow
-
-        $acl = New-Object System.Security.AccessControl.DirectorySecurity
-        $acl.SetAccessRuleProtection($true, $false)
-
-        $acl.AddAccessRule((
-            New-Object System.Security.AccessControl.FileSystemAccessRule(
-                "BUILTIN\Administrators",
-                [System.Security.AccessControl.FileSystemRights]::FullControl,
-                $inheritance,
-                $propagation,
-                $ruleType)))
-        $acl.AddAccessRule((
-            New-Object System.Security.AccessControl.FileSystemAccessRule(
-                "NT AUTHORITY\SYSTEM",
-                [System.Security.AccessControl.FileSystemRights]::FullControl,
-                $inheritance,
-                $propagation,
-                $ruleType)))
-        $acl.AddAccessRule((
-            New-Object System.Security.AccessControl.FileSystemAccessRule(
-                "Users",
-                [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
-                $inheritance,
-                $propagation,
-                $ruleType)))
-
-        Set-Acl -Path $SecureDir -AclObject $acl
     }
+
+    # Apply the ACL
+    Set-Acl -Path $SecureDir -AclObject $secureAcl
+
+    # Verify
+    $currentAcl = Get-Acl -Path $SecureDir
+    $currentOwner = $currentAcl.Owner
+    try {
+        $currentOwnerSID = (New-Object System.Security.Principal.NTAccount($currentOwner)).Translate([System.Security.Principal.SecurityIdentifier])
+        if ($currentOwnerSID -ne $adminsSID -and $currentOwnerSID -ne $systemSID) {
+            throw "SECURITY ERROR: Cannot secure TamperGuard directory - unexpected owner SID: $currentOwnerSID"
+        }
+    } catch {
+        if ($currentOwner -notmatch "Administrators|Beheerders|Administratoren|Administrateurs|SYSTEM") {
+            throw "SECURITY ERROR: Cannot secure TamperGuard directory - unexpected owner: $currentOwner"
+        }
+    }
+
+    foreach ($rule in $currentAcl.Access) {
+        $identity = $rule.IdentityReference.Value
+        $rights = $rule.FileSystemRights
+
+        # Check by SID instead of name
+        try {
+            $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+            if ($sid -eq $usersSID) {
+                if ($rights -match "Write|Modify|FullControl|CreateFiles") {
+                    throw "SECURITY ERROR: TamperGuard directory has insecure permissions for Users"
+                }
+            }
+        } catch {
+            # If translation fails, check by name pattern
+            if ($identity -match "Users|Gebruikers|Benutzer|Utilisateurs|Everyone|Authenticated Users") {
+                if ($rights -match "Write|Modify|FullControl|CreateFiles") {
+                    throw "SECURITY ERROR: TamperGuard directory has insecure permissions for: $identity"
+                }
+            }
+        }
+    }
+
+    Write-Host "   Secure storage verified: $SecureDir" -ForegroundColor Gray
 }
 
 function Enable-WindowsAuditing {
     Write-Host "   Configuring Windows Audit Policies..." -ForegroundColor Gray
-    if (Get-Command "auditpol.exe" -ErrorAction SilentlyContinue) {
-        auditpol /set /subcategory:"Logon" /success:enable | Out-Null
-        auditpol /set /subcategory:"Logon" /failure:enable | Out-Null
-        auditpol /set /subcategory:"Other Logon/Logoff Events" /success:enable | Out-Null
+    if (Test-Path $AuditPolPath) {
+        & $AuditPolPath /set /subcategory:"Logon" /success:enable | Out-Null
+        & $AuditPolPath /set /subcategory:"Logon" /failure:enable | Out-Null
+        & $AuditPolPath /set /subcategory:"Other Logon/Logoff Events" /success:enable | Out-Null
     } else {
-        Write-Host "WARN: auditpol.exe not found. Events might not generate!" -ForegroundColor Red
+        Write-Host "WARN: auditpol.exe not found at $AuditPolPath. Events might not generate!" -ForegroundColor Red
     }
 }
 
 function Test-AuditPolicy {
-    if (-not (Get-Command "auditpol.exe" -ErrorAction SilentlyContinue)) {
-        Write-Warning "auditpol.exe is missing; unable to verify audit policy."
-        return
-    }
-
-    $policy = auditpol /get /subcategory:"Logon" 2>$null
-    if ($policy -and ($policy -notmatch "Success and Failure|Failure")) {
-        Write-Warning "Audit policy for Logon may not be configured!"
-        Write-Warning 'Run: auditpol /set /subcategory:"Logon" /failure:enable'
-    }
+    # Localization of names makes accurate verification unreliable,
+    # and Enable-WindowsAuditing already configures the policies.
+    Write-Host "   Audit policy configured (verify manually if needed)" -ForegroundColor Gray
 }
 
 function Normalize-MaxAttempts {
@@ -136,15 +214,26 @@ function Get-TaskStatus {
 
 function Get-Config {
     if (Test-Path $ConfigPath) {
-        $content = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-        if (-not $content.MaxAttempts) {
-            $content | Add-Member -MemberType NoteProperty -Name MaxAttempts -Value 3 -Force
+        try {
+            $content = Get-Content -Path $ConfigPath -Raw -ErrorAction Stop |
+                       ConvertFrom-Json -ErrorAction Stop
+
+            if (-not $content.MaxAttempts) {
+                $content | Add-Member -MemberType NoteProperty -Name MaxAttempts -Value 3 -Force
+            }
+            if (-not $content.ScriptHashes) {
+                $content | Add-Member -MemberType NoteProperty -Name ScriptHashes -Value @{} -Force
+            }
+            return $content
+        } catch {
+            Write-Host "WARN: Config file corrupted, using defaults. Error: $($_.Exception.Message)" -ForegroundColor Yellow
+            return [PSCustomObject]@{
+                MaxAttempts = 3
+                ScriptHashes = @{}
+            }
         }
-        if (-not $content.ScriptHashes) {
-            $content | Add-Member -MemberType NoteProperty -Name ScriptHashes -Value @{} -Force
-        }
-        return $content
     }
+
     return [PSCustomObject]@{
         MaxAttempts = 3
         ScriptHashes = @{}
@@ -154,7 +243,10 @@ function Get-Config {
 function Save-Config {
     param([pscustomobject]$Config)
     Ensure-SecureStorage
-    $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigPath
+    if (Test-Path $ConfigPath) {
+        Remove-Item -LiteralPath $ConfigPath -Force -ErrorAction SilentlyContinue
+    }
+    $Config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ConfigPath
 }
 
 function Set-Config {
@@ -171,13 +263,9 @@ function Update-ScriptHashes {
     }
 
     $config = Get-Config
-    if (-not $config.ScriptHashes) {
-        $config | Add-Member -MemberType NoteProperty -Name ScriptHashes -Value @{} -Force
-    }
 
-    foreach ($key in $Hashes.Keys) {
-        $config.ScriptHashes.$key = $Hashes[$key]
-    }
+    # Replace the entire ScriptHashes payload to avoid NoteProperty limitations
+    $config.ScriptHashes = $Hashes
 
     Save-Config $config
 }
@@ -188,6 +276,56 @@ function Get-FailCount {
         return $val.Count
     }
     return 0
+}
+
+function Protect-CounterRegistry {
+    if (-not (Test-Path $CounterPath)) {
+        New-Item -Path $CounterPath -Force | Out-Null
+    }
+    try {
+        Set-ItemProperty -Path $CounterPath -Name "Count" -Value 0 -ErrorAction Stop
+    } catch {
+        Write-Host "   WARN: Could not set registry counter value: $($_.Exception.Message)" -ForegroundColor Yellow
+        $regPath = $CounterPath -replace 'HKLM:\\', 'HKLM\'
+        & reg.exe add "$regPath" /v Count /t REG_DWORD /d 0 /f | Out-Null
+    }
+
+    try {
+        $acl = Get-Acl -Path $CounterPath -ErrorAction Stop
+        if (-not $acl) {
+            throw "Get-Acl returned null"
+        }
+
+        $adminsSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+        $systemSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+
+        $acl.SetAccessRuleProtection($true, $false)
+        $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+        $propagation = [System.Security.AccessControl.PropagationFlags]::None
+        $allowType = [System.Security.AccessControl.AccessControlType]::Allow
+        $rights = [System.Security.AccessControl.RegistryRights]::FullControl
+
+        $adminRule = New-Object System.Security.AccessControl.RegistryAccessRule(
+            $adminsSID,
+            $rights,
+            $inheritance,
+            $propagation,
+            $allowType)
+        $systemRule = New-Object System.Security.AccessControl.RegistryAccessRule(
+            $systemSID,
+            $rights,
+            $inheritance,
+            $propagation,
+            $allowType)
+
+        $acl.SetAccessRule($adminRule)
+        $acl.AddAccessRule($systemRule)
+        Set-Acl -Path $CounterPath -AclObject $acl -ErrorAction Stop
+        Write-Host "   Registry ACL protection applied" -ForegroundColor Gray
+    } catch {
+        Write-Host "   WARN: Could not apply registry ACL: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "   Counter will still work but may be less secure" -ForegroundColor Gray
+    }
 }
 
 function Register-TamperGuard {
@@ -206,10 +344,7 @@ function Register-TamperGuard {
     Set-Config -MaxAttempts $MaxAttempts
 
     # Reset counter registry
-    if (-not (Test-Path $CounterPath)) {
-        New-Item -Path $CounterPath -Force | Out-Null
-    }
-    Set-ItemProperty -Path $CounterPath -Name "Count" -Value 0
+    Protect-CounterRegistry
 
     # Script 1: Increment counter and check threshold on failed login
     $scriptFailPath = Join-Path $SecureDir "TamperGuard_OnFail.ps1"
@@ -220,9 +355,9 @@ function Register-TamperGuard {
 `$scriptKey = 'OnFail'
 
 function Write-ShutdownLog {
-    param([string]$Message)
+    param([string]`$Message)
     `$timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    "`$timestamp `$Message" | Out-File "$shutdownLog" -Append
+    "`$timestamp `$Message" | Out-File `$shutdownLog -Append -ErrorAction SilentlyContinue
 }
 
 if (-not (Test-Path `$configPath)) {
@@ -230,16 +365,34 @@ if (-not (Test-Path `$configPath)) {
     Stop-Computer -Force
 }
 
-`$scriptPath = `$MyInvocation.MyCommand.Path
-`$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
-`$maxAttempts = if (`$config -and `$config.MaxAttempts) { `$config.MaxAttempts } else { 3 }
-`$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
-
-if (-not `$expectedHash) {
-    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - BLOCKING EXECUTION"
-    throw "TamperGuard hash not configured - refusing to run"
+`$config = `$null
+try {
+    `$config = Get-Content -Path `$configPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+} catch {
+    Write-ShutdownLog "TamperGuard CONFIG CORRUPTED - TAMPER DETECTED: `$(`$_.Exception.Message)"
+    Stop-Computer -Force
 }
 
+if (-not `$config.MaxAttempts -or -not `$config.ScriptHashes) {
+    Write-ShutdownLog "TamperGuard CONFIG INVALID STRUCTURE - TAMPER DETECTED"
+    Stop-Computer -Force
+}
+
+`$maxAttempts = `$config.MaxAttempts
+`$expectedHash = `$null
+try {
+    `$expectedHash = `$config.ScriptHashes.`$scriptKey
+} catch {
+    Write-ShutdownLog "TamperGuard HASH ACCESS FAILED: `$scriptKey"
+    Stop-Computer -Force
+}
+
+if (-not `$expectedHash) {
+    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - TAMPER DETECTED - SHUTTING DOWN"
+    Stop-Computer -Force
+}
+
+`$scriptPath = `$MyInvocation.MyCommand.Path
 `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
 if (`$actualHash -ne `$expectedHash) {
     Write-ShutdownLog "TamperGuard INTEGRITY FAILURE: `$scriptKey"
@@ -247,16 +400,33 @@ if (`$actualHash -ne `$expectedHash) {
 }
 
 `$mutexName = 'Global\TamperGuard_Counter'
-`$mutex = New-Object System.Threading.Mutex($false, `$mutexName)
-`$locked = $false
+`$mutexSecurity = New-Object System.Security.AccessControl.MutexSecurity
+`$adminRule = New-Object System.Security.AccessControl.MutexAccessRule(
+    "BUILTIN\Administrators",
+    [System.Security.AccessControl.MutexRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+`$systemRule = New-Object System.Security.AccessControl.MutexAccessRule(
+    "NT AUTHORITY\SYSTEM",
+    [System.Security.AccessControl.MutexRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+`$mutexSecurity.AddAccessRule(`$adminRule)
+`$mutexSecurity.AddAccessRule(`$systemRule)
+
+`$createdNew = `$false
+`$mutex = `$null
+`$locked = `$false
 try {
+    `$mutex = New-Object System.Threading.Mutex(
+        `$false,
+        `$mutexName,
+        [ref]`$createdNew,
+        `$mutexSecurity)
     `$locked = `$mutex.WaitOne(5000)
     if (-not `$locked) {
-        Write-ShutdownLog "TamperGuard LOCK TIMEOUT: `$scriptKey"
-        throw "Unable to acquire TamperGuard counter lock"
+        Write-ShutdownLog "TamperGuard MUTEX TIMEOUT - POSSIBLE ATTACK - SHUTTING DOWN"
+        Stop-Computer -Force
     }
 
-    # Increment counter
     `$count = 0
     `$val = Get-ItemProperty -Path `$counterPath -Name 'Count' -ErrorAction SilentlyContinue
     if (`$val) {
@@ -268,21 +438,27 @@ try {
     }
     Set-ItemProperty -Path `$counterPath -Name 'Count' -Value `$count
 
-    # Check threshold
     if (`$count -ge `$maxAttempts) {
-        # Log the shutdown reason
         Write-ShutdownLog "TAMPER DETECTED: `$count failed attempts - SHUTTING DOWN!"
         Start-Sleep -Milliseconds 100
         Stop-Computer -Force
     }
+} catch {
+    Write-ShutdownLog "TamperGuard MUTEX ERROR: `$(`$_.Exception.Message) - SHUTTING DOWN"
+    Stop-Computer -Force
 } finally {
-    if (`$locked) {
-        `$mutex.ReleaseMutex()
+    if (`$locked -and `$mutex) {
+        try { `$mutex.ReleaseMutex() } catch { }
     }
-    `$mutex.Dispose()
+    if (`$mutex) {
+        try { `$mutex.Dispose() } catch { }
+    }
 }
 "@
-    Set-Content -Path $scriptFailPath -Value $scriptFailContent
+    if (Test-Path $scriptFailPath) {
+        Remove-Item -LiteralPath $scriptFailPath -Force -ErrorAction SilentlyContinue
+    }
+    Set-Content -LiteralPath $scriptFailPath -Value $scriptFailContent
 
     # Script 2: Reset counter on successful unlock
     $scriptResetPath = Join-Path $SecureDir "TamperGuard_OnSuccess.ps1"
@@ -293,9 +469,9 @@ try {
 `$scriptKey = 'OnSuccess'
 
 function Write-ShutdownLog {
-    param([string]$Message)
+    param([string]`$Message)
     `$timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    "`$timestamp `$Message" | Out-File "$shutdownLog" -Append
+    "`$timestamp `$Message" | Out-File `$shutdownLog -Append -ErrorAction SilentlyContinue
 }
 
 if (-not (Test-Path `$configPath)) {
@@ -303,15 +479,33 @@ if (-not (Test-Path `$configPath)) {
     Stop-Computer -Force
 }
 
-`$scriptPath = `$MyInvocation.MyCommand.Path
-`$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
-`$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
-
-if (-not `$expectedHash) {
-    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - BLOCKING EXECUTION"
-    throw "TamperGuard hash not configured - refusing to run"
+`$config = `$null
+try {
+    `$config = Get-Content -Path `$configPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+} catch {
+    Write-ShutdownLog "TamperGuard CONFIG CORRUPTED - TAMPER DETECTED: `$(`$_.Exception.Message)"
+    Stop-Computer -Force
 }
 
+if (-not `$config.MaxAttempts -or -not `$config.ScriptHashes) {
+    Write-ShutdownLog "TamperGuard CONFIG INVALID STRUCTURE - TAMPER DETECTED"
+    Stop-Computer -Force
+}
+
+`$expectedHash = `$null
+try {
+    `$expectedHash = `$config.ScriptHashes.`$scriptKey
+} catch {
+    Write-ShutdownLog "TamperGuard HASH ACCESS FAILED: `$scriptKey"
+    Stop-Computer -Force
+}
+
+if (-not `$expectedHash) {
+    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - TAMPER DETECTED - SHUTTING DOWN"
+    Stop-Computer -Force
+}
+
+`$scriptPath = `$MyInvocation.MyCommand.Path
 `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
 if (`$actualHash -ne `$expectedHash) {
     Write-ShutdownLog "TamperGuard INTEGRITY FAILURE: `$scriptKey"
@@ -319,27 +513,53 @@ if (`$actualHash -ne `$expectedHash) {
 }
 
 `$mutexName = 'Global\TamperGuard_Counter'
-`$mutex = New-Object System.Threading.Mutex($false, `$mutexName)
-`$locked = $false
+`$mutexSecurity = New-Object System.Security.AccessControl.MutexSecurity
+`$adminRule = New-Object System.Security.AccessControl.MutexAccessRule(
+    "BUILTIN\Administrators",
+    [System.Security.AccessControl.MutexRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+`$systemRule = New-Object System.Security.AccessControl.MutexAccessRule(
+    "NT AUTHORITY\SYSTEM",
+    [System.Security.AccessControl.MutexRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+`$mutexSecurity.AddAccessRule(`$adminRule)
+`$mutexSecurity.AddAccessRule(`$systemRule)
+
+`$createdNew = `$false
+`$mutex = `$null
+`$locked = `$false
 try {
+    `$mutex = New-Object System.Threading.Mutex(
+        `$false,
+        `$mutexName,
+        [ref]`$createdNew,
+        `$mutexSecurity)
     `$locked = `$mutex.WaitOne(5000)
     if (-not `$locked) {
-        Write-ShutdownLog "TamperGuard LOCK TIMEOUT: `$scriptKey"
-        throw "Unable to acquire TamperGuard counter lock"
+        Write-ShutdownLog "TamperGuard MUTEX TIMEOUT - POSSIBLE ATTACK - SHUTTING DOWN"
+        Stop-Computer -Force
     }
 
     if (-not (Test-Path `$counterPath)) {
         New-Item -Path `$counterPath -Force | Out-Null
     }
     Set-ItemProperty -Path `$counterPath -Name 'Count' -Value 0
+} catch {
+    Write-ShutdownLog "TamperGuard MUTEX ERROR: `$(`$_.Exception.Message) - SHUTTING DOWN"
+    Stop-Computer -Force
 } finally {
-    if (`$locked) {
-        `$mutex.ReleaseMutex()
+    if (`$locked -and `$mutex) {
+        try { `$mutex.ReleaseMutex() } catch { }
     }
-    `$mutex.Dispose()
+    if (`$mutex) {
+        try { `$mutex.Dispose() } catch { }
+    }
 }
 "@
-    Set-Content -Path $scriptResetPath -Value $scriptResetContent
+    if (Test-Path $scriptResetPath) {
+        Remove-Item -LiteralPath $scriptResetPath -Force -ErrorAction SilentlyContinue
+    }
+    Set-Content -LiteralPath $scriptResetPath -Value $scriptResetContent
 
     # Script 3: Activate guard on workstation lock
     $scriptLockPath = Join-Path $SecureDir "TamperGuard_OnLock.ps1"
@@ -350,9 +570,9 @@ try {
 `$scriptKey = 'OnLock'
 
 function Write-ShutdownLog {
-    param([string]$Message)
+    param([string]`$Message)
     `$timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    "`$timestamp `$Message" | Out-File "$shutdownLog" -Append
+    "`$timestamp `$Message" | Out-File `$shutdownLog -Append -ErrorAction SilentlyContinue
 }
 
 if (-not (Test-Path `$configPath)) {
@@ -360,15 +580,33 @@ if (-not (Test-Path `$configPath)) {
     Stop-Computer -Force
 }
 
-`$scriptPath = `$MyInvocation.MyCommand.Path
-`$config = if (Test-Path `$configPath) { Get-Content `$configPath -Raw | ConvertFrom-Json } else { $null }
-`$expectedHash = if (`$config.ScriptHashes) { `$config.ScriptHashes.$scriptKey } else { $null }
-
-if (-not `$expectedHash) {
-    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - BLOCKING EXECUTION"
-    throw "TamperGuard hash not configured - refusing to run"
+`$config = `$null
+try {
+    `$config = Get-Content -Path `$configPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+} catch {
+    Write-ShutdownLog "TamperGuard CONFIG CORRUPTED - TAMPER DETECTED: `$(`$_.Exception.Message)"
+    Stop-Computer -Force
 }
 
+if (-not `$config.MaxAttempts -or -not `$config.ScriptHashes) {
+    Write-ShutdownLog "TamperGuard CONFIG INVALID STRUCTURE - TAMPER DETECTED"
+    Stop-Computer -Force
+}
+
+`$expectedHash = `$null
+try {
+    `$expectedHash = `$config.ScriptHashes.`$scriptKey
+} catch {
+    Write-ShutdownLog "TamperGuard HASH ACCESS FAILED: `$scriptKey"
+    Stop-Computer -Force
+}
+
+if (-not `$expectedHash) {
+    Write-ShutdownLog "TamperGuard MISSING HASH: `$scriptKey - TAMPER DETECTED - SHUTTING DOWN"
+    Stop-Computer -Force
+}
+
+`$scriptPath = `$MyInvocation.MyCommand.Path
 `$actualHash = (Get-FileHash -Algorithm SHA256 -Path `$scriptPath).Hash
 if (`$actualHash -ne `$expectedHash) {
     Write-ShutdownLog "TamperGuard INTEGRITY FAILURE: `$scriptKey"
@@ -376,27 +614,53 @@ if (`$actualHash -ne `$expectedHash) {
 }
 
 `$mutexName = 'Global\TamperGuard_Counter'
-`$mutex = New-Object System.Threading.Mutex($false, `$mutexName)
-`$locked = $false
+`$mutexSecurity = New-Object System.Security.AccessControl.MutexSecurity
+`$adminRule = New-Object System.Security.AccessControl.MutexAccessRule(
+    "BUILTIN\Administrators",
+    [System.Security.AccessControl.MutexRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+`$systemRule = New-Object System.Security.AccessControl.MutexAccessRule(
+    "NT AUTHORITY\SYSTEM",
+    [System.Security.AccessControl.MutexRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+`$mutexSecurity.AddAccessRule(`$adminRule)
+`$mutexSecurity.AddAccessRule(`$systemRule)
+
+`$createdNew = `$false
+`$mutex = `$null
+`$locked = `$false
 try {
+    `$mutex = New-Object System.Threading.Mutex(
+        `$false,
+        `$mutexName,
+        [ref]`$createdNew,
+        `$mutexSecurity)
     `$locked = `$mutex.WaitOne(5000)
     if (-not `$locked) {
-        Write-ShutdownLog "TamperGuard LOCK TIMEOUT: `$scriptKey"
-        throw "Unable to acquire TamperGuard counter lock"
+        Write-ShutdownLog "TamperGuard MUTEX TIMEOUT - POSSIBLE ATTACK - SHUTTING DOWN"
+        Stop-Computer -Force
     }
 
     if (-not (Test-Path `$counterPath)) {
         New-Item -Path `$counterPath -Force | Out-Null
     }
     Set-ItemProperty -Path `$counterPath -Name 'Count' -Value 0
+} catch {
+    Write-ShutdownLog "TamperGuard MUTEX ERROR: `$(`$_.Exception.Message) - SHUTTING DOWN"
+    Stop-Computer -Force
 } finally {
-    if (`$locked) {
-        `$mutex.ReleaseMutex()
+    if (`$locked -and `$mutex) {
+        try { `$mutex.ReleaseMutex() } catch { }
     }
-    `$mutex.Dispose()
+    if (`$mutex) {
+        try { `$mutex.Dispose() } catch { }
+    }
 }
 "@
-    Set-Content -Path $scriptLockPath -Value $scriptLockContent
+    if (Test-Path $scriptLockPath) {
+        Remove-Item -LiteralPath $scriptLockPath -Force -ErrorAction SilentlyContinue
+    }
+    Set-Content -LiteralPath $scriptLockPath -Value $scriptLockContent
 
     $scriptHashSources = @{
         OnFail = $scriptFailPath
@@ -438,7 +702,7 @@ try {
   </Settings>
   <Actions>
     <Exec>
-      <Command>powershell.exe</Command>
+      <Command>$PowerShellPath</Command>
       <Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptFailPath"</Arguments>
     </Exec>
   </Actions>
@@ -474,7 +738,7 @@ try {
   </Settings>
   <Actions>
     <Exec>
-      <Command>powershell.exe</Command>
+      <Command>$PowerShellPath</Command>
       <Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptResetPath"</Arguments>
     </Exec>
   </Actions>
@@ -510,7 +774,7 @@ try {
   </Settings>
   <Actions>
     <Exec>
-      <Command>powershell.exe</Command>
+      <Command>$PowerShellPath</Command>
       <Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptLockPath"</Arguments>
     </Exec>
   </Actions>
@@ -630,9 +894,17 @@ switch ($choice.ToUpper()) {
         }
     }
     "4" {
-        $count = Read-Host "`nHow many recent attempts to show? (default 20)"
-        if ([string]::IsNullOrWhiteSpace($count)) { $count = 20 }
-        Show-FailedAttempts -Last ([int]$count)
+        $countInput = Read-Host "`nHow many recent attempts to show? (default 20)"
+        $count = 20
+        if (-not [string]::IsNullOrWhiteSpace($countInput)) {
+            $parsed = 0
+            if ([int]::TryParse($countInput, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le 1000) {
+                $count = $parsed
+            } else {
+                Write-Host "Invalid input, using default (20)." -ForegroundColor Yellow
+            }
+        }
+        Show-FailedAttempts -Last $count
     }
     "5" {
         if (-not (Test-Path $CounterPath)) {
