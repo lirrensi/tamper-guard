@@ -6,12 +6,35 @@
 # Target: causal users who want better security while away.
 # Initial intent: to lock PC better while away.
 
+# === LIMITATIONS ===
+
 # Does not cover if attacker made log in - they can remove scripts or simply extract your keys anyway.
 # Does not cover coerced input - no canary mechanism present, and even if it was its useless anyway cause restart resets the attack loop.
 
-# Use with BitLocker, else an attacker can repeat attempts multiple times or sideload if hardware is stolen.
+# Does not cover tampering while shutdown - attacker can boot from USB, install hardware keyloggers, etc.
+# Does not prevent BIOS/UEFI manipulation if not password-protected.
+# Does not cover DMA attacks (Thunderbolt/PCIe) - enable Kernel DMA Protection separately.
+
 # Easily bypassable with Safe Mode: An attacker with physical access can reboot into Safe Mode (unless prevented by BitLocker/BIOS password), where Task Scheduler won't run.
-# This is not enterprise grade solution, use actual windows native hardening instead!
+# Bypassable by disabling Task Scheduler from external OS if BitLocker not enabled.
+# Counter resets on reboot - attacker gets 3 fresh attempts per boot cycle.
+
+# === REQUIREMENTS ===
+
+# CRITICAL: Use with BitLocker (with TPM+PIN for best security), else an attacker can:
+#   - Boot from USB and disable this script entirely
+#   - Access files directly from external OS
+#   - Repeatedly attempt logins across multiple boots
+#   - Sideload malicious software
+
+# RECOMMENDED additional hardening:
+#   - BIOS/UEFI password to prevent boot order changes
+#   - Secure Boot enabled
+#   - Disable Safe Mode boot (bcdedit /set {default} safeboot minimal)
+#   - Physical port locks/disabled USB ports in BIOS
+
+# This is not enterprise grade solution, use actual Windows native hardening instead!
+# (Account lockout policies, Credential Guard, Windows Hello, etc.)
 
 
 #Requires -RunAsAdministrator

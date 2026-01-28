@@ -21,11 +21,17 @@ It's specifically designed to protect against:
 ✅ Works like a charm (though we're not saying it's *perfect* 😈)
 
 ## 🛠️ How to Use (It's Actually Pretty Easy!)
-### Method 1: The Easy Way (Recommended)
+### Method 1: Install from IEX (No Download Required)
+Run this command directly in PowerShell as Administrator:
+```powershell
+iex (iwr -Uri 'https://raw.githubusercontent.com/lirrensi/tamper-guard/main/TamperGuard.ps1').Content
+```
+
+### Method 2: The Easy Way (Clone & Run)
 - Run `run.bat` (it'll ask for admin privileges)
 - Choose option 1 to register the guard
 
-### Method 2: If the .bat doesn't work
+### Method 3: If the .bat doesn't work
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "& '.\TamperGuard.ps1'"
 ```
